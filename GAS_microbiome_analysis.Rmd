@@ -1,0 +1,3206 @@
+---
+title: "The Oropharyngeal Microbiome in Remote-Living Australian Children with and without Group A Streptococcal Infection: downstream R analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r Sys.Date()`"
+---
+
+# Purpose
+
+This document contains the downstream R analyses used for the manuscript:
+
+The Oropharyngeal Microbiome in Remote-Living Australian Children with and without Group A Streptococcal Infection
+
+The workflow begins from the processed ASV/taxonomy data and study metadata, additionally MaAslin 2 tables. Raw PacBio sequence processing and taxonomic assignment were performed using the bioinformatics workflow described in the manuscript and are not reproduced here.
+
+# 1. Setup
+
+```{r setup}
+library(phyloseq)
+library(vegan)
+library(tidyverse)
+library(readxl)
+library(lme4)
+library(lmerTest)
+library(ggrepel)
+library(ggdist)
+library(RColorBrewer)
+library(patchwork)
+library(grid)
+
+set.seed(123)
+
+```
+
+# 2. Import processed data
+
+```{r import-data}
+
+# Import all data
+
+# Main decontam-filtered phyloseq object
+
+
+physeq <- readRDS(
+  "data/physeq.rds"
+)
+
+
+# Biological samples only
+physeq_bio <- subset_samples(
+  physeq,
+  !is.na(Timepoint)
+)
+
+physeq_bio <- prune_taxa(
+  taxa_sums(physeq_bio) > 0,
+  physeq_bio
+)
+
+
+# Clinical metadata
+
+clinical <- read.csv(
+  "data/clinical_metadata.csv",
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# Remove duplicated column names
+clinical <- clinical[
+  ,
+  !duplicated(names(clinical)),
+  drop = FALSE
+]
+
+# Preserve sample ID
+clinical$Sample_ID <- rownames(clinical)
+
+# column names used throughout this R Markdown
+if (!"GAS_isolated" %in% names(clinical) &&
+    "GASIsolated" %in% names(clinical)) {
+  
+  clinical$GAS_isolated <- clinical$GASIsolated
+}
+
+if (!"Event_name" %in% names(clinical) &&
+    "EventName" %in% names(clinical)) {
+  
+  clinical$Event_name <- clinical$EventName
+}
+
+if (!"sample_id" %in% names(clinical)) {
+  clinical$sample_id <- clinical$Sample_ID
+}
+
+# Final checks
+stopifnot(!anyDuplicated(names(clinical)))
+
+stopifnot(
+  all(
+    c(
+      "participant_id",
+      "GAS_isolated",
+      "Event_name",
+      "Shannon",
+      "Richness"
+    ) %in% names(clinical)
+  )
+)
+
+# qPCR data
+
+qpcr <- read.csv(
+  "data/qpcr_data.csv",
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+qpcr$Sample_ID <- rownames(qpcr)
+
+
+qpcr_analysis <- qpcr %>%
+  filter(
+    Sample_or_Control == "True Sample",
+    GASIsolated %in% c("No", "Yes"),
+    !is.na(copies_per_ul)
+  ) %>%
+  mutate(
+    log10_load = log10(copies_per_ul),
+    GASIsolated = factor(
+      GASIsolated,
+      levels = c("No", "Yes")
+    ),
+    Timepoint = factor(
+      Timepoint,
+      levels = c(1, 2)
+    )
+  )
+
+
+
+# Mean relative-abundance barplot inputs
+
+
+metadata <- read_excel(
+  "data/barplot_metadata.xlsx",
+  na = "NA"
+) %>%
+  select(sample_id, participant_id, EventName)
+
+otu_raw <- read_csv(
+  "data/barplot_otu.csv",
+  show_col_types = FALSE
+)
+
+# First column contains sample IDs
+names(otu_raw)[1] <- "sample_id"
+
+otu_counts <- otu_raw %>%
+  select(sample_id, starts_with("Otu")) %>%
+  pivot_longer(
+    -sample_id,
+    names_to = "otu",
+    values_to = "count"
+  )
+
+taxonomy <- read_tsv(
+  "data/barplot_taxonomy.txt",
+  show_col_types = FALSE
+)
+# PCoA inputs
+
+pcoa_asv <- read.csv(
+  "data/NMDS_otu.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+analysis_metadata <- read.csv(
+  "data/NMDS_metadata.csv",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Use sample IDs as metadata row names
+rownames(analysis_metadata) <- analysis_metadata$sample_id
+
+# Confirm that the same samples are present
+stopifnot(
+  setequal(
+    colnames(pcoa_asv),
+    rownames(analysis_metadata)
+  )
+)
+# MaAsLin inputs and results
+
+
+maaslin_results <- read.delim(
+  "data/maaslin_results.tsv",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+maaslin_abundance <- read.csv(
+  "data/maaslin_abundance.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = TRUE
+)
+
+maaslin_metadata <- read.csv(
+  "data/maaslin_metadata.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+
+# Basic checks
+
+
+cat("Biological samples:", nsamples(physeq_bio), "\n")
+cat("Microbial features:", ntaxa(physeq_bio), "\n")
+cat("Clinical metadata rows:", nrow(clinical), "\n")
+cat("qPCR analysis rows:", nrow(qpcr_analysis), "\n")
+cat("MaAsLin results:", nrow(maaslin_results), "\n")
+```
+
+# 3. Figure 3A
+
+```{r Fig 3A}
+## Figure 3A: Species prevalence and mean relative abundance
+
+# Collapse ASVs to species level
+physeq_species <- tax_glom(
+  physeq_bio,
+  taxrank = "Species",
+  NArm = FALSE
+)
+
+# Convert counts to relative abundance within each sample
+physeq_rel <- transform_sample_counts(
+  physeq_species,
+  function(x) x / sum(x)
+)
+
+# Convert phyloseq object to long-format dataframe
+df_rel <- psmelt(physeq_rel)
+
+# Calculate species prevalence and mean relative abundance
+# Prevalence is defined as the percentage of samples in which
+# relative abundance exceeds 0.1% (0.001 as a proportion)
+taxa_summary <- df_rel %>%
+  group_by(Species) %>%
+  summarise(
+    prevalence = mean(Abundance > 0.001) * 100,
+    mean_RA = mean(Abundance) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(
+    !is.na(Species),
+    Species != ""
+  )
+
+# Retain taxa with prevalence >= 30% for visualisation
+taxa_plot <- taxa_summary %>%
+  filter(
+    prevalence >= 30,
+    mean_RA > 0
+  )
+
+# Species selected for labelling in the figure
+labels_to_show <- c(
+  "Streptococcus salivarius",
+  "Prevotella_7 melaninogenica",
+  "Neisseria subflava",
+  "Prevotella_7 histicola",
+  "Leptotrichia wadei A",
+  "Veillonella nakazawae",
+  "Gemella haemolysans A",
+  "Fusobacterium periodonticum B",
+  "Porphyromonas sp000467855",
+  "Alloprevotella sp900095835"
+)
+
+# Add labels only to selected taxa
+taxa_plot <- taxa_plot %>%
+  mutate(
+    label = ifelse(
+      Species %in% labels_to_show,
+      Species,
+      NA
+    )
+  )
+
+# Generate bubble plot
+p_fig1 <- ggplot(
+  taxa_plot,
+  aes(
+    x = prevalence,
+    y = mean_RA,
+    size = mean_RA,
+    colour = prevalence
+  )
+) +
+  geom_point(alpha = 0.9) +
+  geom_text_repel(
+    aes(label = label),
+    na.rm = TRUE,
+    size = 3.5,
+    max.overlaps = 100,
+    box.padding = 0.4,
+    point.padding = 0.25,
+    segment.color = "grey50"
+  ) +
+  scale_y_log10() +
+  scale_colour_viridis_c(
+    option = "plasma"
+  ) +
+  labs(
+    x = "Prevalence (% samples; RA > 0.1%)",
+    y = "Mean relative abundance (%) [log scale]",
+    size = "Mean RA (%)",
+    colour = "Prevalence (%)"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.text = element_text(
+      size = 10
+    ),
+    legend.title = element_text(
+      size = 10,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 9
+    )
+  ) +
+  guides(
+    colour = guide_colourbar(order = 1),
+    size = guide_legend(order = 2)
+  )
+
+# Display Figure 1
+p_fig1
+
+```
+
+# 4. Figure 3B
+
+
+
+```{r }
+
+## Figure 3B: Core oropharyngeal microbiome
+
+# This figure is reconstructed at the ASV level. ASVs are displayed using their species-level taxonomic assignment.
+# The ASV identifiers below correspond to those represented in the original manuscript figure.
+
+# Convert ASV counts to within-sample relative abundance
+
+
+physeq_core_rel <- transform_sample_counts(
+  physeq_bio,
+  function(x) x / sum(x)
+)
+
+# Convert phyloseq object to long-format dataframe
+df_core <- psmelt(physeq_core_rel)
+
+# 
+# Calculate ASV-level prevalence and mean relative abundance
+# 
+
+core_asv_summary <- df_core %>%
+  group_by(OTU, Species) %>%
+  summarise(
+    prevalence = mean(Abundance > 0) * 100,
+    mean_RA = mean(Abundance) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(
+    !is.na(Species),
+    Species != "",
+    Species != "Unclassified"
+  )
+
+# 
+# ASVs represented in manuscript Figure 
+
+
+figure_asvs <- c(
+  "d2c240d6f7cb0684c07a322beecd5bc3", # Veillonella infantium
+  "f16544024de03f8900e8fb0360803898", # Veillonella atypica
+  "2e7af4f9f28db187b4b2a35ec81df5ef", # Streptococcus salivarius
+  "9a06050a90c2716c55a246f5604010a4", # Prevotella_7 melaninogenica
+  "87055fb617d58996f8199370c55d11b3", # Prevotella melaninogenica
+  "19aadf44a85e3bdc1ad1490a981b0875", # Peptostreptococcus canis
+  "5642046f35728a5845076b74a655b06f", # Nanosynbacter sp005697565
+  "3772ab95b2ce0644ec6086b93bd83480", # Mogibacterium diversum
+  "3e36f1e025c8579a2eae0813b6744453", # Granulicatella sp001058355
+  "716ad31a42f1aeeeb40d510922921752", # Gemella sanguinis
+  "b87a883baa35e21ab24bafb806e0f11d", # Gemella haemolysans A
+  "dff6ef81606e5b3ef6fdcdf871019949", # Fusobacterium periodonticum D
+  "1bd8c69d51bb1ce7c8a4bccc65b25d9e", # Fusobacterium periodonticum B
+  "b9d3ead411608b5a07ff4d2a188fb807", # Fusobacterium periodonticum
+  "d471754956b6e53a0a56bb320c531a6d"  # Campylobacter concisus
+)
+
+# Extract ASVs represented in Figure 
+core_plot <- core_asv_summary %>%
+  filter(OTU %in% figure_asvs)
+
+# Confirm that all 15 expected ASVs are present
+stopifnot(nrow(core_plot) == 15)
+
+# Inspect the underlying values used for plotting
+core_plot %>%
+  select(OTU, Species, prevalence, mean_RA) %>%
+  arrange(desc(prevalence))
+
+#order the species order used in the manuscript figure
+
+figure_order <- c(
+  "Veillonella infantium",
+  "Veillonella atypica",
+  "Streptococcus salivarius",
+  "Prevotella_7 melaninogenica",
+  "Prevotella melaninogenica",
+  "Peptostreptococcus canis",
+  "Nanosynbacter sp005697565",
+  "Mogibacterium diversum",
+  "Granulicatella sp001058355",
+  "Gemella sanguinis",
+  "Gemella haemolysans A",
+  "Fusobacterium periodonticum D",
+  "Fusobacterium periodonticum B",
+  "Fusobacterium periodonticum",
+  "Campylobacter concisus"
+)
+
+core_plot <- core_plot %>%
+  mutate(
+    Species = factor(
+      Species,
+      levels = rev(figure_order)
+    )
+  )
+
+
+# plotting
+
+
+p_fig2 <- ggplot(
+  core_plot,
+  aes(
+    x = prevalence,
+    y = Species
+  )
+) +
+  geom_col(
+    fill = "lightpink"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Prevalence (%)",
+    y = NULL
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(
+      size = 12,
+      face = "bold"
+    ),
+    axis.text.x = element_text(
+      size = 10
+    ),
+    axis.text.y = element_text(
+      size = 12,
+      face = "italic"
+    )
+  )
+
+# Display figure
+
+p_fig2
+
+```
+
+# 5. Figure 4A
+
+```{r }
+##Figure 4A: Mean relative abundance of barplot of top taxa
+
+##load table ###
+
+
+otu_rel_abund <- inner_join(
+  metadata,
+  otu_counts,
+  by = "sample_id"
+) %>%
+  inner_join(
+    taxonomy,
+    by = "otu"
+  ) %>%
+  group_by(sample_id) %>%
+  mutate(
+    rel_abund = count / sum(count)
+  ) %>%
+  ungroup() %>%
+  select(-count) %>%
+  pivot_longer(
+    cols = c(
+      kingdom,
+      phylum,
+      class,
+      order,
+      family,
+      genus,
+      species
+    ),
+    names_to = "level",
+    values_to = "taxon"
+  )
+
+
+# Calculate species-level relative abundance within each sample
+
+
+taxon_rel_abund <- otu_rel_abund %>%
+  filter(level == "species") %>%
+  group_by(
+    sample_id,
+    taxon,
+    participant_id,
+    EventName
+  ) %>%
+  summarise(
+    rel_abund = sum(rel_abund),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_rel_abund = 100 * rel_abund,
+    taxon = str_replace(
+      taxon,
+      "(.*)_unclassified",
+      "Unclassified *\\1*"
+    ),
+    taxon = str_replace(
+      taxon,
+      "^(\\S*)$",
+      "*\\1*"
+    )
+  )
+
+
+
+# Identify low-abundance taxa to pool as "Other"
+
+# Taxa with a maximum relative abundance below 15% are pooled.
+
+taxon_pool <- taxon_rel_abund %>%
+  group_by(taxon) %>%
+  summarise(
+    pool = max(mean_rel_abund) < 15,
+    mean = mean(mean_rel_abund),
+    .groups = "drop"
+  )
+
+
+# Pool low-abundance taxa within each individual sample
+
+
+barplot_sample <- taxon_rel_abund %>%
+  inner_join(
+    taxon_pool,
+    by = "taxon"
+  ) %>%
+  mutate(
+    taxon = if_else(
+      pool,
+      "Other",
+      taxon
+    )
+  ) %>%
+  group_by(
+    taxon,
+    sample_id,
+    participant_id,
+    EventName
+  ) %>%
+  summarise(
+    mean_rel_abund = sum(mean_rel_abund),
+    mean = min(mean),
+    .groups = "drop"
+  )
+
+
+# Calculate mean relative abundance across samples at each timepoint
+
+
+barplot_mean <- barplot_sample %>%
+  group_by(
+    EventName,
+    taxon
+  ) %>%
+  summarise(
+    mean_rel_abund = mean(mean_rel_abund),
+    mean = mean(mean),
+    .groups = "drop"
+  )
+
+
+
+# Plot mean species-level relative abundance by sampling timepoint
+
+
+barplot_mean %>%
+  mutate(
+    taxon = factor(taxon),
+    taxon = fct_reorder(
+      taxon,
+      mean
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = EventName,
+      y = mean_rel_abund,
+      fill = taxon
+    )
+  ) +
+  geom_col() +
+  scale_fill_manual(
+    name = NULL,
+    values = c(
+      brewer.pal(8, "Paired"),
+      "gray",
+      "coral4",
+      "forestgreen",
+      "brown",
+      "aquamarine2",
+      "chocolate1",
+      "gray26",
+      "cornflowerblue",
+      "cornsilk4",
+      "darkblue",
+      "darkgoldenrod1",
+      "darkmagenta",
+      "darkorange",
+      "darkorchid",
+      "firebrick",
+      "slateblue",
+      "violetred3",
+      "seagreen1",
+      "springgreen2",
+      "olivedrab4",
+      "limegreen",
+      "mediumseagreen",
+      "darkgreen",
+      "forestgreen",
+      "gray26"
+    )
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Screening_Visit_1",
+      "Screening_Visit_2"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Sampling Timepoint",
+    y = "Mean Relative Abundance (%)"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.y = element_text(
+      size = 10,
+      color = "black",
+      face = "bold"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      color = "black",
+      face = "bold"
+    ),
+    axis.title.x = element_text(
+      size = 10,
+      color = "black",
+      face = "bold"
+    ),
+    legend.position = "right",
+    legend.text = element_text(
+      size = 10
+    ),
+    legend.box.spacing = unit(
+      1.5,
+      "cm"
+    )
+  )
+
+
+
+```
+
+# 6. Figure 4B
+
+```{r}
+## Figure 4B: Within-child versus Between-child Bray-Curtis dissimilarity
+
+# Calculate Bray-Curtis dissimilarity
+
+
+bray_dist <- phyloseq::distance(
+  physeq_bio,
+  method = "bray"
+)
+
+bray_matrix <- as.matrix(bray_dist)
+
+
+
+# Extract sample metadata
+
+
+meta_bray <- data.frame(
+  sample_data(physeq_bio)
+)
+
+meta_bray$sample_id <- rownames(meta_bray)
+
+
+
+#Convert Bray-Curtis matrix to pairwise long format
+
+
+bray_pairs <- as.data.frame(
+  as.table(bray_matrix),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::rename(
+    sample1 = Var1,
+    sample2 = Var2,
+    bray = Freq
+  ) %>%
+  dplyr::filter(
+    sample1 != sample2
+  )
+
+
+
+# Add metadata for both samples in each pair
+
+
+meta_1 <- meta_bray %>%
+  dplyr::select(
+    sample_id,
+    participant_id,
+    Timepoint
+  ) %>%
+  dplyr::rename(
+    sample1 = sample_id,
+    participant1 = participant_id,
+    timepoint1 = Timepoint
+  )
+
+meta_2 <- meta_bray %>%
+  dplyr::select(
+    sample_id,
+    participant_id,
+    Timepoint
+  ) %>%
+  dplyr::rename(
+    sample2 = sample_id,
+    participant2 = participant_id,
+    timepoint2 = Timepoint
+  )
+
+bray_pairs <- bray_pairs %>%
+  dplyr::left_join(
+    meta_1,
+    by = "sample1"
+  ) %>%
+  dplyr::left_join(
+    meta_2,
+    by = "sample2"
+  )
+
+
+# Remove duplicated sample-pair comparisons
+
+
+bray_pairs <- bray_pairs %>%
+  dplyr::mutate(
+    pair_id = purrr::map2_chr(
+      sample1,
+      sample2,
+      ~ paste(sort(c(.x, .y)), collapse = "__")
+    )
+  ) %>%
+  dplyr::distinct(
+    pair_id,
+    .keep_all = TRUE
+  )
+
+
+
+ #Define within-child longitudinal comparisons
+
+within_child <- bray_pairs %>%
+  dplyr::filter(
+    participant1 == participant2,
+    timepoint1 != timepoint2
+  ) %>%
+  dplyr::transmute(
+    comparison = "Within-child",
+    bray = bray
+  )
+
+
+# Define between-child baseline comparisons
+
+between_child <- bray_pairs %>%
+  dplyr::filter(
+    participant1 != participant2,
+    timepoint1 == 1,
+    timepoint2 == 1
+  ) %>%
+  dplyr::transmute(
+    comparison = "Between-child",
+    bray = bray
+  )
+
+
+
+# Combine comparison groups
+
+
+bray_comparison <- dplyr::bind_rows(
+  within_child,
+  between_child
+)
+
+
+#  Summarise Bray-Curtis dissimilarity
+
+
+bray_summary <- bray_comparison %>%
+  dplyr::group_by(comparison) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean = mean(bray),
+    median = median(bray),
+    sd = sd(bray),
+    .groups = "drop"
+  )
+
+bray_summary
+
+
+#  Compare within-child and between-child dissimilarity
+
+
+wilcox_bray <- wilcox.test(
+  bray ~ comparison,
+  data = bray_comparison,
+  exact = FALSE
+)
+
+wilcox_bray
+
+
+# Prepare data for plotting
+
+
+set.seed(123)
+
+between_plot <- between_child %>%
+  dplyr::slice_sample(
+    n = 600
+  )
+
+plot_data <- dplyr::bind_rows(
+  within_child,
+  between_plot
+)
+
+plot_data$comparison <- factor(
+  plot_data$comparison,
+  levels = c(
+    "Within-child",
+    "Between-child"
+  )
+)
+
+
+
+# Plot
+
+
+ggplot(
+  plot_data,
+  aes(
+    x = comparison,
+    y = bray,
+    colour = comparison
+  )
+) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    fill = NA
+  ) +
+  geom_jitter(
+    width = 0.16,
+    alpha = 0.45,
+    size = 0.5
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = 1.02,
+    label = "Wilcoxon p < 0.001",
+    size = 3.5
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Within-child" = "#0072B2",
+      "Between-child" = "#D55E00"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0.38, 1.04),
+    breaks = c(
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Bray-Curtis dissimilarity"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(
+      size = 11,
+      colour = "black",
+      face = "bold"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    axis.title.y = element_text(
+      size = 11,
+      colour = "black",
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+  
+
+```
+
+## 7. Figure 4C
+
+```{r}
+## Figure 4C: Change in Shannon diversity at T1 and T2
+
+# Calculate Shannon diversity
+
+
+alpha_div <- phyloseq::estimate_richness(
+  physeq_bio,
+  measures = "Shannon"
+)
+
+alpha_div$sample_id <- rownames(alpha_div)
+
+# Extract metadata
+meta_alpha <- data.frame(
+  sample_data(physeq_bio)
+)
+
+meta_alpha$sample_id <- rownames(meta_alpha)
+
+# Join Shannon diversity with participant metadata
+alpha_div <- alpha_div %>%
+  dplyr::left_join(
+    meta_alpha %>%
+      dplyr::select(
+        sample_id,
+        participant_id,
+        Timepoint
+      ),
+    by = "sample_id"
+  )
+
+
+# Retain participants sampled at both timepoints
+
+
+alpha_paired <- alpha_div %>%
+  dplyr::filter(
+    Timepoint %in% c(1, 2)
+  ) %>%
+  dplyr::group_by(participant_id) %>%
+  dplyr::filter(
+    dplyr::n_distinct(Timepoint) == 2
+  ) %>%
+  dplyr::ungroup()
+
+
+
+# Create T1 and T2 plotting labels
+
+
+alpha_paired <- alpha_paired %>%
+  dplyr::mutate(
+    Timepoint_label = dplyr::case_when(
+      Timepoint == 1 ~ "T1",
+      Timepoint == 2 ~ "T2"
+    ),
+    Timepoint_label = factor(
+      Timepoint_label,
+      levels = c("T1", "T2")
+    )
+  )
+
+
+
+ # data for paired Wilcoxon test
+
+
+alpha_wide <- alpha_paired %>%
+  dplyr::select(
+    participant_id,
+    Timepoint_label,
+    Shannon
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Timepoint_label,
+    values_from = Shannon
+  ) %>%
+  tidyr::drop_na(T1, T2)
+
+
+#Paired Wilcoxon  test
+
+wilcox_shannon <- wilcox.test(
+  alpha_wide$T1,
+  alpha_wide$T2,
+  paired = TRUE,
+  exact = FALSE
+)
+
+wilcox_shannon
+
+# Plot 
+
+ggplot(
+  alpha_paired,
+  aes(
+    x = Timepoint_label,
+    y = Shannon,
+    group = participant_id
+  )
+) +
+  geom_line(
+    colour = "grey75",
+    linewidth = 0.4,
+    alpha = 0.5
+  ) +
+  geom_point(
+    aes(colour = Timepoint_label),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+  stat_summary(
+    aes(group = Timepoint_label),
+    fun = mean,
+    geom = "point",
+    shape = 21,
+    size = 3.2,
+    fill = "black",
+    colour = "black"
+  ) +
+  stat_summary(
+    aes(group = Timepoint_label),
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.14,
+    linewidth = 0.8,
+    colour = "black"
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(alpha_paired$Shannon, na.rm = TRUE) + 0.1,
+    label = "Wilcoxon p = 0.10",
+    size = 3.5
+  ) +
+  scale_colour_manual(
+    values = c(
+      "T1" = "#0072B2",
+      "T2" = "#D55E00"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Shannon diversity"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(
+      size = 11,
+      colour = "black",
+      face = "bold"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    axis.title.y = element_text(
+      size = 11,
+      colour = "black",
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+```
+
+# 8. Figure 4D 
+
+```{r}
+
+
+# Figure 4D: PCoA of microbiome composition by timepoint
+
+# Convert ASV abundance table to numeric
+asv_num <- pcoa_asv %>%
+  mutate(
+    across(
+      everything(),
+      ~ parse_number(as.character(.x))
+    )
+  ) %>%
+  as.data.frame()
+
+
+
+# Align metadata to ASV table
+
+# Samples are columns in the ASV table
+stopifnot(
+  setequal(
+    colnames(asv_num),
+    rownames(analysis_metadata)
+  )
+)
+
+# Put metadata in exactly the same order as ASV table samples
+metadata_pcoa <- analysis_metadata[
+  colnames(asv_num),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(asv_num),
+    rownames(metadata_pcoa)
+  )
+)
+
+cat(
+  "Samples available for PCoA:",
+  ncol(asv_num),
+  "\n"
+)
+
+
+
+# Retain samples with required metadata
+
+keep <- (
+  !is.na(metadata_pcoa$Timepoint) &
+  metadata_pcoa$Timepoint != "" &
+  !is.na(metadata_pcoa$participant_id)
+)
+
+cat(
+  "Samples excluded because of missing timepoint/participant:",
+  sum(!keep),
+  "\n"
+)
+
+asv_num <- asv_num[
+  ,
+  keep,
+  drop = FALSE
+]
+
+metadata_pcoa <- metadata_pcoa[
+  keep,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(asv_num),
+    rownames(metadata_pcoa)
+  )
+)
+
+
+
+# Construct phyloseq object
+
+# Rows = ASVs, columns = samples
+OTU <- otu_table(
+  as.matrix(asv_num),
+  taxa_are_rows = TRUE
+)
+
+SAM <- sample_data(
+  metadata_pcoa
+)
+
+ps <- phyloseq(
+  OTU,
+  SAM
+)
+
+
+# Remove zero-read samples if any
+ps <- prune_samples(
+  sample_sums(ps) > 0,
+  ps
+)
+
+
+# Convert counts to relative abundance
+ps_rel <- transform_sample_counts(
+  ps,
+  function(x) x / sum(x)
+)
+
+
+
+# Bray-Curtis distance and PCoA
+
+dist_bc <- phyloseq::distance(
+  ps_rel,
+  method = "bray"
+)
+
+ord_bc <- ordinate(
+  ps_rel,
+  method = "PCoA",
+  distance = dist_bc
+)
+
+
+# Variance explained by PCoA axes
+eig <- ord_bc$values$Relative_eig
+
+xlab <- paste0(
+  "PCoA1 (",
+  round(100 * eig[1], 1),
+  "%)"
+)
+
+ylab <- paste0(
+  "PCoA2 (",
+  round(100 * eig[2], 1),
+  "%)"
+)
+
+
+
+# Repeated-measures PERMANOVA
+
+meta_perm <- data.frame(
+  sample_data(ps_rel)
+)
+
+meta_perm <- meta_perm[
+  labels(dist_bc),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(meta_perm),
+    labels(dist_bc)
+  )
+)
+
+set.seed(123)
+
+permanova_timepoint <- adonis2(
+  dist_bc ~ Timepoint,
+  data = meta_perm,
+  permutations = 999,
+  strata = meta_perm$participant_id
+)
+
+permanova_timepoint
+
+
+# Extract values for figure annotation
+permanova_r2 <- permanova_timepoint$R2[1]
+permanova_p <- permanova_timepoint$`Pr(>F)`[1]
+
+permanova_label <- paste0(
+  "PERMANOVA R² = ",
+  sprintf("%.3f", permanova_r2),
+  ", p = ",
+  ifelse(
+    permanova_p < 0.001,
+    "< 0.001",
+    sprintf("%.3f", permanova_p)
+  )
+)
+
+
+
+# Plot
+
+p_pcoa_timepoint <- plot_ordination(
+  ps_rel,
+  ord_bc,
+  color = "Timepoint"
+) +
+  
+  geom_point(
+    aes(fill = Timepoint),
+    shape = 21,
+    size = 3,
+    alpha = 0.75,
+    stroke = 0.5,
+    colour = "black"
+  ) +
+  
+  stat_ellipse(
+    aes(
+      group = Timepoint,
+      fill = Timepoint,
+      colour = Timepoint
+    ),
+    type = "norm",
+    level = 0.95,
+    geom = "polygon",
+    alpha = 0.06,
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "TP1" = "#6879B8",
+      "TP2" = "#E68632"
+    )
+  ) +
+  
+  scale_colour_manual(
+    values = c(
+      "TP1" = "#6879B8",
+      "TP2" = "#E68632"
+    )
+  ) +
+  
+  labs(
+    x = xlab,
+    y = ylab,
+    fill = "Timepoint",
+    colour = "Timepoint"
+  ) +
+  
+  coord_equal() +
+  
+  theme_classic(
+    base_size = 12
+  ) +
+  
+  theme(
+    axis.title = element_text(
+      size = 12,
+      face = "bold",
+      colour = "black"
+    ),
+    
+    axis.text = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    
+    axis.ticks = element_line(
+      linewidth = 0.4,
+      colour = "black"
+    ),
+    
+    legend.position = "right",
+    
+    legend.title = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    
+    legend.text = element_text(
+      size = 10
+    ),
+    
+    plot.margin = margin(
+      6, 8, 6, 6
+    )
+  ) +
+  
+  guides(
+    colour = "none",
+    
+    fill = guide_legend(
+      title = "Timepoint",
+      override.aes = list(
+        shape = 21,
+        size = 3.5,
+        colour = "black",
+        alpha = 0.8
+      )
+    )
+  ) +
+  
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = permanova_label,
+    hjust = -0.05,
+    vjust = 1.5,
+    size = 3.5
+  )
+
+
+# Display Figure 4D
+p_pcoa_timepoint
+```
+
+# 8. Figure 5A
+
+```{r}
+#Figure 5A: Alpha diversity plots for GAS status
+
+
+# Prepare analysis dataset from clinical metadata
+alpha_gas <- clinical %>%
+  filter(
+    GAS_isolated %in% c("No", "Yes"),
+    !is.na(Shannon),
+    !is.na(Richness),
+    !is.na(Event_name),
+    !is.na(participant_id)
+  ) %>%
+  mutate(
+    GAS_isolated = factor(
+      GAS_isolated,
+      levels = c("Yes", "No")
+    )
+  )
+
+
+# Colour palette
+gas_cols <- c(
+  "Yes" = "#5968B8",
+  "No"  = "#F28E00"
+)
+
+
+
+# Shannon diversity plot
+
+
+p_shannon <- ggplot(
+  alpha_gas,
+  aes(
+    x = GAS_isolated,
+    y = Shannon,
+    fill = GAS_isolated,
+    colour = GAS_isolated
+  )
+) +
+  ggdist::stat_halfeye(
+    adjust = 0.5,
+    width = 0.6,
+    justification = -0.25,
+    .width = 0,
+    point_colour = NA,
+    alpha = 0.95
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 1.5,
+    alpha = 0.45,
+    colour = "grey55"
+  ) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    fill = "white",
+    colour = "black",
+    linewidth = 0.7
+  ) +
+  scale_fill_manual(values = gas_cols) +
+  scale_colour_manual(values = gas_cols) +
+  labs(
+    x = "GAS status",
+    y = "Shannon-Wiener index"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(
+      face = "bold",
+      colour = "black"
+    ),
+    axis.text = element_text(
+      colour = "black",
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+
+
+# Richness plot
+
+
+p_richness <- ggplot(
+  alpha_gas,
+  aes(
+    x = GAS_isolated,
+    y = Richness,
+    fill = GAS_isolated,
+    colour = GAS_isolated
+  )
+) +
+  ggdist::stat_halfeye(
+    adjust = 0.5,
+    width = 0.6,
+    justification = -0.25,
+    .width = 0,
+    point_colour = NA,
+    alpha = 0.95
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 1.5,
+    alpha = 0.45,
+    colour = "grey55"
+  ) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    fill = "white",
+    colour = "black",
+    linewidth = 0.7
+  ) +
+  scale_fill_manual(values = gas_cols) +
+  scale_colour_manual(values = gas_cols) +
+  labs(
+    x = "GAS status",
+    y = "Chao1 richness"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(
+      face = "bold",
+      colour = "black"
+    ),
+    axis.text = element_text(
+      colour = "black",
+      face = "bold"
+    ),
+    legend.position = "none"
+  )
+
+
+
+# Mixed-effects models
+# GAS-negative is the reference group
+
+
+alpha_gas_model <- alpha_gas %>%
+  mutate(
+    GAS_isolated = relevel(
+      factor(GAS_isolated),
+      ref = "No"
+    )
+  )
+
+
+# Shannon model
+model_shannon <- lmer(
+  Shannon ~ GAS_isolated + Event_name + (1 | participant_id),
+  data = alpha_gas_model
+)
+
+summary(model_shannon)
+
+confint(
+  model_shannon,
+  parm = "GAS_isolatedYes",
+  method = "Wald"
+)
+
+
+# Richness model
+model_richness <- lmer(
+  Richness ~ GAS_isolated + Event_name + (1 | participant_id),
+  data = alpha_gas_model
+)
+
+summary(model_richness)
+
+confint(
+  model_richness,
+  parm = "GAS_isolatedYes",
+  method = "Wald"
+)
+
+
+
+# Combine Figure 5A panels
+
+
+figure5A <- p_shannon + p_richness +
+  plot_annotation(tag_levels = "A")
+
+figure5A
+
+```
+
+# 9. Figure 5B
+
+```{r}
+
+#Figure 5B: PcOA plot of GAS status
+asv_num <- pcoa_asv %>%
+  mutate(across(everything(), ~ parse_number(as.character(.x)))) %>%
+  as.data.frame()
+
+SAM <- sample_data(analysis_metadata)
+
+# Build phyloseq object 
+ps <- phyloseq(OTU,SAM)                          # minimal
+
+# Drop samples with total reads <= 0
+ps <- prune_samples(sample_sums(ps) > 0, ps)
+ps
+ps.rel <- transform_sample_counts(ps, function(x) x / sum(x))
+
+#  Bray-Curtis
+dist.bc <- phyloseq::distance(ps.rel, method = "bray")
+ord.bc  <- ordinate(ps.rel, method = "PCoA", distance = dist.bc)
+
+# Pick which ordination to plot:
+ord <- ord.bc   
+
+# Extract percent variance for axis labels
+eig <- ord$values$Relative_eig
+xlab <- paste0("PCoA1 (", round(100 * eig[1], 1), "%)")
+ylab <- paste0("PCoA2 (", round(100 * eig[2], 1), "%)")
+
+##plotting
+p_pcoa <- plot_ordination(
+  ps.rel,
+  ord.bc,
+  color = "GASIsolated"
+) +
+  geom_point(
+    aes(fill = GASIsolated),
+    shape = 21,
+    size = 3,
+    alpha = 0.75,
+    stroke = 0.5,
+    colour = "black"
+  ) +
+  
+  # Light filled ellipse
+  stat_ellipse(
+    aes(
+      group = GASIsolated,
+      fill = GASIsolated,
+      colour = GASIsolated
+    ),
+    type = "norm",
+    level = 0.95,
+    geom = "polygon",
+    alpha = 0.06,
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Yes" = "#6879B8",
+      "No" = "#E68632"
+    )
+  ) +
+  
+  scale_colour_manual(
+    values = c(
+      "Yes" = "#6879B8",
+      "No" = "#E68632"
+    )
+  ) +
+  
+  labs(
+    x = xlab,
+    y = ylab,
+    fill = "GASIsolated",
+    colour = "GASIsolated"
+  ) +
+  
+  coord_equal() +
+  
+  theme_classic(base_size = 12) +
+  
+  theme(
+    panel.border = element_blank(),
+    
+    axis.title = element_text(
+      size = 12,
+      face = "bold",
+      colour = "black"
+    ),
+    
+    axis.text = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    
+    axis.ticks = element_line(
+      linewidth = 0.4,
+      colour = "black"
+    ),
+    
+    legend.position = "right",
+    
+    legend.title = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    
+    legend.text = element_text(
+      size = 10
+    ),
+    
+    plot.margin = margin(
+      6, 8, 6, 6
+    )
+  ) +
+  
+  guides(
+    colour = "none",
+    fill = guide_legend(
+      title = "GAS Status",
+      override.aes = list(
+        shape = 21,
+        size = 3.5,
+        colour = "black",
+        alpha = 0.8
+      )
+    )
+  )
+
+
+p_pcoa
+
+```
+
+# 10. Figure 5C 
+
+```{r}
+### Figure 5C: Differential abundance 
+## MaAsLin2 coefficient plot
+
+# Keep taxa significantly associated with GAS isolation
+
+gas_plot <- maaslin_results %>%
+  filter(
+    metadata == "GAS_isolated",
+    value == "Yes",
+    qval < 0.25
+  ) %>%
+  arrange(coef) %>%
+  mutate(
+    feature = factor(feature, levels = feature),
+    metadata = "GAS_isolated"
+  )
+
+
+# Coefficient plot
+ggplot(
+  gas_plot,
+  aes(
+    x = coef,
+    y = feature
+  )
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey75",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    size = 3.2,
+    colour = "#8FAFD0",
+    alpha = 0.9
+  ) +
+  facet_wrap(
+    ~ metadata,
+    scales = "free_y"
+  ) +
+  labs(
+    x = "Coefficient",
+    y = "Taxon"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title.x = element_text(
+      size = 13,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title.y = element_text(
+      size = 13,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"
+    ),
+    axis.text.y = element_text(
+      size = 10,
+      colour = "black",
+      face = "bold"
+    ),
+    strip.background = element_rect(
+      fill = "grey85",
+      colour = "grey40",
+      linewidth = 0.5
+    ),
+    strip.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    panel.grid.major.x = element_line(
+      colour = "grey90",
+      linewidth = 0.5
+    ),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+```
+
+# 11. Figure 5D
+
+
+```{r}
+# Figure 5D: Differentially abundant taxa
+
+#Aggregate ASVs/features to the species displayed
+#    in Figure 5D
+
+
+fig5d_counts <- maaslin_abundance %>%
+  transmute(
+
+    sample_id = sample_id,
+
+    `Leptotrichia wadei` =
+      rowSums(
+        across(
+          matches("^Leptotrichia\\.wadei")
+        ),
+        na.rm = TRUE
+      ),
+
+    `Prevotella melaninogenica` =
+      rowSums(
+        across(
+          matches("^Prevotella\\.melaninogenica($|\\.)")
+        ),
+        na.rm = TRUE
+      ),
+
+    `Rothia aeria` =
+      Rothia.aeria,
+
+    `Streptococcus parasanguinis` =
+      rowSums(
+        across(
+          matches("^Streptococcus\\.parasanguinis($|\\.)")
+        ),
+        na.rm = TRUE
+      )
+  )
+
+
+#Add GAS isolation status
+
+fig5d <- fig5d_counts %>%
+
+  left_join(
+    maaslin_metadata %>%
+  select(sample_id, GAS_isolated),
+    by = "sample_id"
+  ) %>%
+
+  # Keep only GAS-positive and GAS-negative samples
+  filter(
+    GAS_isolated %in% c("Yes", "No")
+  ) %>%
+
+  # Convert species columns to long format
+  pivot_longer(
+    cols = -c(
+      sample_id,
+      GAS_isolated
+    ),
+    names_to = "Taxon",
+    values_to = "read_count"
+  ) %>%
+
+  mutate(
+
+    # log10 transform used in the manuscript figure
+    log10_count = log10(read_count + 1),
+
+    # GAS-positive first, then GAS-negative
+    GAS_isolated = factor(
+      GAS_isolated,
+      levels = c("Yes", "No")
+    ),
+
+    # Preserve panel order
+    Taxon = factor(
+      Taxon,
+      levels = c(
+        "Leptotrichia wadei",
+        "Prevotella melaninogenica",
+        "Rothia aeria",
+        "Streptococcus parasanguinis"
+      )
+    )
+  )
+
+
+
+fig5d_plot <- fig5d %>%
+  filter(
+    Taxon != "Rothia aeria" |
+      read_count > 0
+  )
+
+
+
+# Plot Figure 5D
+
+
+gas_cols <- c(
+  "Yes" = "#F26B5E",
+  "No"  = "#55B9D0"
+)
+
+figure5d <- ggplot(
+  fig5d_plot,
+  aes(
+    x = GAS_isolated,
+    y = log10_count,
+    fill = GAS_isolated,
+    colour = GAS_isolated
+  )
+) +
+
+  geom_boxplot(
+    width = 0.50,
+    alpha = 0.75,
+    outlier.shape = NA,
+    colour = "black",
+    linewidth = 0.6
+  ) +
+
+  geom_jitter(
+    width = 0.12,
+    size = 1.0,
+    alpha = 0.70
+  ) +
+
+  facet_wrap(
+    ~ Taxon,
+    scales = "free_y",
+    ncol = 3
+  ) +
+
+  scale_fill_manual(
+    values = gas_cols
+  ) +
+
+  scale_colour_manual(
+    values = gas_cols
+  ) +
+
+  labs(
+    x = "GAS status",
+    y = "Log10(read count + 1)",
+    fill = "GAS_isolated",
+    colour = "GAS_isolated"
+  ) +
+
+  theme_classic(
+    base_size = 11
+  ) +
+
+  theme(
+
+    legend.position = "top",
+
+    legend.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+
+    legend.text = element_text(
+      size = 10
+    ),
+
+    strip.background = element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.6
+    ),
+
+    strip.text = element_text(
+      face = "italic",
+      size = 11,
+      colour = "black"
+    ),
+
+    axis.title.x = element_text(
+      face = "bold",
+      size = 12
+    ),
+
+    axis.title.y = element_text(
+      face = "bold",
+      size = 12
+    ),
+
+    axis.text.x = element_text(
+      size = 10,
+      colour = "black"
+    ),
+
+    axis.text.y = element_text(
+      size = 9,
+      colour = "black"
+    ),
+
+    axis.ticks = element_line(
+      colour = "black"
+    ),
+
+    panel.spacing = unit(
+      0.25,
+      "lines"
+    )
+  )
+
+
+# Display figure
+figure5d
+
+```
+
+# 12. Figure 5E
+
+
+```{r}
+# Figure 5E: Baseline microbiome and subsequent GAS acquisition
+
+# Define GAS acquisition trajectory
+#Baseline GAS-negative children only
+gas_trajectory <- clinical %>%
+  filter(
+    EventName %in% c(
+      "Screening_Visit_1",
+      "Screening_Visit_2"
+    ),
+    GASIsolated %in% c("Yes", "No")
+  ) %>%
+  select(
+    participant_id,
+    EventName,
+    GASIsolated
+  ) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = EventName,
+    values_from = GASIsolated
+  ) %>%
+  filter(
+    Screening_Visit_1 == "No"
+  ) %>%
+  mutate(
+    Acquisition = case_when(
+      Screening_Visit_2 == "No" ~ "Remained GAS− (T2−)",
+      Screening_Visit_2 == "Yes" ~ "Acquired GAS (T2+)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(Acquisition)
+  )
+
+table(
+  gas_trajectory$Acquisition
+)
+
+baseline_meta <- clinical %>%
+  filter(
+    EventName == "Screening_Visit_1"
+  ) %>%
+  inner_join(
+    gas_trajectory %>%
+      select(
+        participant_id,
+        Acquisition
+      ),
+    by = "participant_id"
+  )
+
+baseline_meta$Acquisition <- factor(
+  baseline_meta$Acquisition,
+  levels = c(
+    "Remained GAS− (T2−)",
+    "Acquired GAS (T2+)"
+  )
+)
+
+alpha_acq <- baseline_meta %>%
+  filter(
+    !is.na(Shannon),
+    !is.na(Richness)
+  )
+
+wilcox_acquisition_shannon <- wilcox.test(
+  Shannon ~ Acquisition,
+  data = alpha_acq,
+  exact = FALSE
+)
+
+wilcox_acquisition_chao1 <- wilcox.test(
+  Richness ~ Acquisition,
+  data = alpha_acq,
+  exact = FALSE,
+  correct = FALSE
+)
+
+wilcox_acquisition_shannon
+wilcox_acquisition_chao1
+
+sample_ids <- maaslin_abundance$sample_id
+
+abundance_matrix <- maaslin_abundance %>%
+  select(
+    -sample_id
+  ) %>%
+  mutate(
+    across(
+      everything(),
+      as.numeric
+    )
+  ) %>%
+  as.data.frame()
+
+rownames(abundance_matrix) <- sample_ids
+
+baseline_beta <- baseline_meta %>%
+  filter(
+    Sample_ID %in% rownames(abundance_matrix)
+  ) %>%
+  arrange(
+    match(
+      Sample_ID,
+      rownames(abundance_matrix)
+    )
+  )
+
+abundance_baseline <- abundance_matrix[
+  baseline_beta$Sample_ID,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(abundance_baseline),
+    baseline_beta$Sample_ID
+  )
+)
+
+bray_baseline <- vegdist(
+  abundance_baseline,
+  method = "bray"
+)
+
+set.seed(123)
+
+permanova_acquisition <- adonis2(
+  bray_baseline ~ Acquisition,
+  data = baseline_beta,
+  permutations = 999
+)
+
+permanova_acquisition
+
+pcoa_baseline <- cmdscale(
+  bray_baseline,
+  eig = TRUE,
+  k = 2
+)
+
+pcoa_df <- data.frame(
+  Sample_ID = rownames(
+    pcoa_baseline$points
+  ),
+  PCoA1 = pcoa_baseline$points[, 1],
+  PCoA2 = pcoa_baseline$points[, 2]
+) %>%
+  left_join(
+    baseline_beta %>%
+      select(
+        Sample_ID,
+        Acquisition
+      ),
+    by = "Sample_ID"
+  )
+
+acq_cols <- c(
+  "Remained GAS− (T2−)" = "#4C91C7",
+  "Acquired GAS (T2+)" = "#F28E45"
+)
+
+R2_acq <- permanova_acquisition$R2[1]
+p_perm_acq <- permanova_acquisition$`Pr(>F)`[1]
+
+p_alpha <- ggplot(
+  alpha_acq,
+  aes(
+    x = Acquisition,
+    y = Shannon,
+    colour = Acquisition
+  )
+) +
+  geom_boxplot(
+    width = 0.50,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.7
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 2,
+    alpha = 0.85
+  ) +
+  scale_colour_manual(
+    values = acq_cols
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      alpha_acq$Shannon,
+      na.rm = TRUE
+    ) + 0.10,
+    label = "Wilcoxon p = 0.365",
+    size = 3.5
+  ) +
+  labs(
+    title = "Baseline alpha diversity and subsequent GAS acquisition",
+    x = NULL,
+    y = "Baseline alpha diversity (Shannon)"
+  ) +
+  theme_classic(
+    base_size = 11
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.text.x = element_text(
+      face = "bold",
+      size = 8,
+      colour = "black"
+    ),
+    axis.text.y = element_text(
+      colour = "black"
+    ),
+    legend.position = "none"
+  )
+
+p_pcoa <- ggplot(
+  pcoa_df,
+  aes(
+    x = Acquisition,
+    y = PCoA1,
+    colour = Acquisition
+  )
+) +
+  geom_boxplot(
+    width = 0.50,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.7
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 2,
+    alpha = 0.85
+  ) +
+  scale_colour_manual(
+    values = acq_cols
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      pcoa_df$PCoA1,
+      na.rm = TRUE
+    ) + 0.04,
+    label = paste0(
+      "PERMANOVA R² = ",
+      sprintf("%.3f", R2_acq),
+      ", p = ",
+      sprintf("%.3f", p_perm_acq)
+    ),
+    size = 3.5
+  ) +
+  labs(
+    title = "Baseline community composition and subsequent GAS acquisition",
+    subtitle = "Baseline PCoA1 (Bray-Curtis), restricted to children GAS− at T1",
+    x = NULL,
+    y = "Baseline community axis (PCoA1)"
+  ) +
+  theme_classic(
+    base_size = 11
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+    plot.subtitle = element_text(
+      size = 9
+    ),
+    axis.text.x = element_text(
+      face = "bold",
+      size = 8,
+      colour = "black"
+    ),
+    axis.text.y = element_text(
+      colour = "black"
+    ),
+    legend.position = "none"
+  )
+
+figure_acquisition <- p_alpha + p_pcoa
+
+figure_acquisition
+
+
+```
+
+# 13. Figure 5F
+
+
+
+```{r}
+### Figure 5F: GAS loss
+gas_pairs <- clinical %>%
+  filter(
+    EventName %in% c("Screening_Visit_1", "Screening_Visit_2"),
+    GASIsolated %in% c("Yes", "No")
+  ) %>%
+  select(
+    participant_id,
+    EventName,
+    GASIsolated
+  ) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = EventName,
+    values_from = GASIsolated
+  ) %>%
+  filter(
+    !is.na(Screening_Visit_1),
+    !is.na(Screening_Visit_2)
+  )
+
+table(
+  gas_pairs$Screening_Visit_1,
+  gas_pairs$Screening_Visit_2
+)
+
+gas_loss_ids <- gas_pairs %>%
+  filter(
+    Screening_Visit_1 == "Yes"
+  ) %>%
+  mutate(
+    GAS_trajectory = case_when(
+      Screening_Visit_2 == "Yes" ~ "Persistent GAS",
+      Screening_Visit_2 == "No" ~ "GAS loss",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(GAS_trajectory)
+  ) %>%
+  select(
+    participant_id,
+    GAS_trajectory
+  )
+
+table(
+  gas_loss_ids$GAS_trajectory
+)
+
+gas_loss_meta <- clinical %>%
+  filter(
+    EventName == "Screening_Visit_1"
+  ) %>%
+  inner_join(
+    gas_loss_ids,
+    by = "participant_id"
+  ) %>%
+  filter(
+    !is.na(Sample_ID),
+    Sample_ID %in% sample_names(physeq_bio)
+  ) %>%
+  distinct(
+    Sample_ID,
+    .keep_all = TRUE
+  )
+
+table(
+  gas_loss_meta$GAS_trajectory
+)
+
+physeq_loss <- prune_samples(
+  gas_loss_meta$Sample_ID,
+  physeq_bio
+)
+
+physeq_loss <- prune_taxa(
+  taxa_sums(physeq_loss) > 0,
+  physeq_loss
+)
+
+stopifnot(
+  setequal(
+    sample_names(physeq_loss),
+    gas_loss_meta$Sample_ID
+  )
+)
+
+alpha_loss <- gas_loss_meta %>%
+  filter(
+    !is.na(Shannon),
+    !is.na(Richness)
+  ) %>%
+  mutate(
+    GAS_trajectory = factor(
+      GAS_trajectory,
+      levels = c(
+        "Persistent GAS",
+        "GAS loss"
+      )
+    )
+  )
+
+table(
+  alpha_loss$GAS_trajectory
+)
+
+wilcox_loss_shannon <- wilcox.test(
+  Shannon ~ GAS_trajectory,
+  data = alpha_loss
+)
+
+wilcox_loss_chao1 <- wilcox.test(
+  Richness ~ GAS_trajectory,
+  data = alpha_loss,
+  exact = FALSE,
+  correct = FALSE
+)
+
+wilcox_loss_shannon
+wilcox_loss_chao1
+
+bray_loss <- phyloseq::distance(
+  physeq_loss,
+  method = "bray"
+)
+
+meta_loss <- gas_loss_meta[
+  match(
+    labels(bray_loss),
+    gas_loss_meta$Sample_ID
+  ),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    labels(bray_loss),
+    meta_loss$Sample_ID
+  )
+)
+
+set.seed(123)
+
+permanova_loss <- adonis2(
+  bray_loss ~ GAS_trajectory,
+  data = meta_loss,
+  permutations = 999
+)
+
+permanova_loss
+
+disp_loss <- betadisper(
+  bray_loss,
+  meta_loss$GAS_trajectory
+)
+
+set.seed(123)
+
+permdisp_loss <- permutest(
+  disp_loss,
+  permutations = 999
+)
+
+permdisp_loss
+
+ord_loss <- ordinate(
+  physeq_loss,
+  method = "PCoA",
+  distance = bray_loss
+)
+
+pcoa_loss <- as.data.frame(
+  ord_loss$vectors[, 1:2]
+)
+
+pcoa_loss$Sample_ID <- rownames(pcoa_loss)
+
+trajectory_map <- setNames(
+  as.character(gas_loss_meta$GAS_trajectory),
+  gas_loss_meta$Sample_ID
+)
+
+pcoa_loss$GAS_trajectory <- unname(
+  trajectory_map[pcoa_loss$Sample_ID]
+)
+
+alpha_loss$Figure_group <- factor(
+  alpha_loss$GAS_trajectory,
+  levels = c(
+    "Persistent GAS",
+    "GAS loss"
+  ),
+  labels = c(
+    "Persistent GAS (T2+)",
+    "Lost GAS (T2−)"
+  )
+)
+
+pcoa_loss$Figure_group <- factor(
+  pcoa_loss$GAS_trajectory,
+  levels = c(
+    "Persistent GAS",
+    "GAS loss"
+  ),
+  labels = c(
+    "Persistent GAS (T2+)",
+    "Lost GAS (T2−)"
+  )
+)
+
+cols_loss <- c(
+  "Persistent GAS (T2+)" = "#5B9BD5",
+  "Lost GAS (T2−)" = "#ED7D31"
+)
+
+R2_loss <- permanova_loss$R2[1]
+p_perm_loss <- permanova_loss$`Pr(>F)`[1]
+
+p_loss_alpha <- ggplot(
+  alpha_loss,
+  aes(
+    x = Figure_group,
+    y = Shannon,
+    colour = Figure_group
+  )
+) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.8
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 2.5,
+    alpha = 0.75
+  ) +
+  scale_colour_manual(
+    values = cols_loss
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      alpha_loss$Shannon,
+      na.rm = TRUE
+    ) + 0.12,
+    label = "Wilcoxon p = 0.491",
+    size = 4.8,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Baseline alpha diversity and subsequent GAS loss",
+    x = NULL,
+    y = "Baseline alpha diversity (Shannon)"
+  ) +
+  theme_classic(
+    base_size = 14
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      face = "bold",
+      size = 15
+    ),
+    axis.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    axis.text = element_text(
+      face = "bold",
+      size = 12,
+      colour = "black"
+    )
+  )
+
+p_loss_beta <- ggplot(
+  pcoa_loss,
+  aes(
+    x = Figure_group,
+    y = Axis.1,
+    colour = Figure_group
+  )
+) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.8
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 2.5,
+    alpha = 0.75
+  ) +
+  scale_colour_manual(
+    values = cols_loss
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      pcoa_loss$Axis.1,
+      na.rm = TRUE
+    ) + 0.04,
+    label = paste0(
+      "PERMANOVA R² = ",
+      sprintf("%.3f", R2_loss),
+      ", p = ",
+      sprintf("%.3f", p_perm_loss)
+    ),
+    size = 4.8,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Baseline community composition and subsequent GAS loss",
+    subtitle = "Baseline PCoA1 (Bray-Curtis), restricted to children GAS+ at T1",
+    x = NULL,
+    y = "Baseline community axis (PCoA1)"
+  ) +
+  theme_classic(
+    base_size = 14
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      face = "bold",
+      size = 15
+    ),
+    plot.subtitle = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    axis.text = element_text(
+      face = "bold",
+      size = 12,
+      colour = "black"
+    )
+  )
+
+figure_loss <- p_loss_alpha +
+  p_loss_beta +
+  plot_layout(
+    widths = c(1, 1)
+  )
+
+figure_loss
+```
+
+# 14. Figure 6A and 6B
+```{r}
+symptom_trajectory <- clinical %>%
+  mutate(
+    Timepoint_symptom = case_when(
+      EventName == "Screening_Visit_1" ~ 1,
+      EventName == "Screening_Visit_2" ~ 2,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    participant_id != 104
+  ) %>%
+  select(
+    participant_id,
+    Timepoint_symptom,
+    Symptomatic
+  ) %>%
+  distinct() %>%
+  filter(
+    !is.na(Timepoint_symptom)
+  ) %>%
+  pivot_wider(
+    names_from = Timepoint_symptom,
+    values_from = Symptomatic,
+    names_prefix = "T"
+  )
+
+table(
+  symptom_trajectory$T1,
+  symptom_trajectory$T2,
+  useNA = "ifany"
+)
+
+symptom_ids <- symptom_trajectory %>%
+  filter(
+    T1 == "No",
+    T2 %in% c("No", "Yes")
+  ) %>%
+  mutate(
+    Symptom_trajectory = case_when(
+      T2 == "No" ~ "Remained asymptomatic",
+      T2 == "Yes" ~ "Developed symptoms"
+    )
+  ) %>%
+  select(
+    participant_id,
+    Symptom_trajectory
+  )
+
+table(
+  symptom_ids$Symptom_trajectory
+)
+
+symptom_meta <- qpcr_analysis %>%
+  left_join(
+    symptom_ids,
+    by = "participant_id"
+  ) %>%
+  filter(
+    Timepoint == 1,
+    Symptom_trajectory %in% c(
+      "Developed symptoms",
+      "Remained asymptomatic"
+    )
+  ) %>%
+  distinct(
+    Sample_ID,
+    .keep_all = TRUE
+  )
+
+table(
+  symptom_meta$Symptom_trajectory
+)
+
+symptom_meta <- symptom_meta %>%
+  filter(
+    Sample_ID %in% sample_names(physeq)
+  )
+
+rownames(symptom_meta) <- symptom_meta$Sample_ID
+
+physeq_symptom <- prune_samples(
+  sample_names(physeq) %in% symptom_meta$Sample_ID,
+  physeq
+)
+
+physeq_symptom <- prune_taxa(
+  taxa_sums(physeq_symptom) > 0,
+  physeq_symptom
+)
+
+symptom_meta <- symptom_meta[
+  sample_names(physeq_symptom),
+  ,
+  drop = FALSE
+]
+
+sample_data(physeq_symptom) <- sample_data(symptom_meta)
+
+alpha_symptom <- estimate_richness(
+  physeq_symptom,
+  measures = c(
+    "Shannon",
+    "Chao1"
+  )
+)
+
+meta_symptom <- data.frame(
+  sample_data(physeq_symptom)
+)
+
+rownames(alpha_symptom) <- sub(
+  "^X",
+  "",
+  rownames(alpha_symptom)
+)
+
+alpha_symptom$Symptom_trajectory <- meta_symptom[
+  rownames(alpha_symptom),
+  "Symptom_trajectory"
+]
+
+alpha_symptom$Symptom_trajectory <- factor(
+  alpha_symptom$Symptom_trajectory,
+  levels = c(
+    "Remained asymptomatic",
+    "Developed symptoms"
+  )
+)
+
+meta_symptom$Symptom_trajectory <- factor(
+  meta_symptom$Symptom_trajectory,
+  levels = c(
+    "Remained asymptomatic",
+    "Developed symptoms"
+  )
+)
+
+table(
+  alpha_symptom$Symptom_trajectory
+)
+
+wilcox_symptom_shannon <- wilcox.test(
+  Shannon ~ Symptom_trajectory,
+  data = alpha_symptom
+)
+
+wilcox_symptom_chao1 <- wilcox.test(
+  Chao1 ~ Symptom_trajectory,
+  data = alpha_symptom
+)
+
+wilcox_symptom_shannon
+wilcox_symptom_chao1
+
+bray_symptom <- phyloseq::distance(
+  physeq_symptom,
+  method = "bray"
+)
+
+meta_symptom <- meta_symptom[
+  labels(bray_symptom),
+  ,
+  drop = FALSE
+]
+
+set.seed(123)
+
+permanova_symptom <- adonis2(
+  bray_symptom ~ Symptom_trajectory,
+  data = meta_symptom,
+  permutations = 999
+)
+
+permanova_symptom
+
+disp_symptom <- betadisper(
+  bray_symptom,
+  meta_symptom$Symptom_trajectory
+)
+
+set.seed(123)
+
+permdisp_symptom <- permutest(
+  disp_symptom,
+  permutations = 999
+)
+
+permdisp_symptom
+
+ord_symptom <- ordinate(
+  physeq_symptom,
+  method = "PCoA",
+  distance = "bray"
+)
+
+pcoa_symptom <- as.data.frame(
+  ord_symptom$vectors[, 1:2]
+)
+
+rownames(pcoa_symptom) <- sub(
+  "^X",
+  "",
+  rownames(pcoa_symptom)
+)
+
+pcoa_symptom$Sample_ID <- rownames(pcoa_symptom)
+
+pcoa_symptom$Symptom_trajectory <- meta_symptom[
+  match(
+    pcoa_symptom$Sample_ID,
+    rownames(meta_symptom)
+  ),
+  "Symptom_trajectory"
+]
+
+pcoa_symptom$Symptom_trajectory <- factor(
+  pcoa_symptom$Symptom_trajectory,
+  levels = c(
+    "Remained asymptomatic",
+    "Developed symptoms"
+  )
+)
+
+cols_symptom <- c(
+  "Remained asymptomatic" = "#5B9BD5",
+  "Developed symptoms" = "#ED7D31"
+)
+
+p_symptom_alpha <- ggplot(
+  alpha_symptom,
+  aes(
+    x = Symptom_trajectory,
+    y = Shannon,
+    colour = Symptom_trajectory
+  )
+) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.7
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 2,
+    alpha = 0.6
+  ) +
+  scale_colour_manual(
+    values = cols_symptom
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      alpha_symptom$Shannon,
+      na.rm = TRUE
+    ) + 0.12,
+    label = "Wilcoxon p = 0.884",
+    size = 4
+  ) +
+  labs(
+    title = "Baseline alpha diversity and subsequent symptom development",
+    x = NULL,
+    y = "Baseline alpha diversity (Shannon)"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    ),
+    axis.text = element_text(
+      face = "bold",
+      size = 10
+    ),
+    axis.title.y = element_text(
+      face = "bold",
+      size = 11
+    )
+  )
+
+p_symptom_beta <- ggplot(
+  pcoa_symptom,
+  aes(
+    x = Symptom_trajectory,
+    y = Axis.1,
+    colour = Symptom_trajectory
+  )
+) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    fill = NA,
+    linewidth = 0.7
+  ) +
+  geom_jitter(
+    width = 0.08,
+    size = 2,
+    alpha = 0.6
+  ) +
+  scale_colour_manual(
+    values = cols_symptom
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(
+      pcoa_symptom$Axis.1,
+      na.rm = TRUE
+    ) + 0.04,
+    label = "PERMANOVA R² = 0.033, p = 0.581",
+    size = 4
+  ) +
+  labs(
+    title = "Baseline community composition and subsequent symptom development",
+    x = NULL,
+    y = "Baseline community axis (PCoA1)"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    axis.text = element_text(
+      face = "bold",
+      size = 12
+    ),
+    axis.title.y = element_text(
+      face = "bold",
+      size = 11
+    )
+  )
+
+figure_symptom <- p_symptom_alpha +
+  p_symptom_beta
+
+figure_symptom
+```
+
+# 18. Supplementary figure 
+```{r}
+
+# Supplementary Figure: Total bacterial load
+model_load <- lmer(
+  log10_load ~ GASIsolated + Timepoint + (1 | participant_id),
+  data = qpcr_analysis
+)
+
+summary(model_load)
+
+confint(
+  model_load,
+  method = "Wald"
+)
+
+p_load_gas <- ggplot(
+  qpcr_analysis,
+  aes(
+    x = GASIsolated,
+    y = log10_load
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.5,
+    linewidth = 0.6
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 1.8,
+    alpha = 0.65
+  ) +
+  labs(
+    x = "GAS status",
+    y = expression(
+      Log[10]~"total bacterial load (16S rRNA gene copies/"*mu*"L)"
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(colour = "black")
+  )
+
+p_load_time <- ggplot(
+  qpcr_analysis,
+  aes(
+    x = Timepoint,
+    y = log10_load
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.5,
+    linewidth = 0.6
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 1.8,
+    alpha = 0.65
+  ) +
+  labs(
+    x = "Timepoint",
+    y = expression(
+      Log[10]~"total bacterial load (16S rRNA gene copies/"*mu*"L)"
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(colour = "black")
+  )
+
+supp_bacterial_load <- (
+  p_load_gas + p_load_time
+) +
+  plot_annotation(
+    tag_levels = "A"
+  )
+
+supp_bacterial_load
+
+
+```
+# 19. Session information
+
+```{r session-info}
+sessionInfo()
+```
