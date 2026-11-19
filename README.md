@@ -6,7 +6,7 @@ This repository contains the downstream R analysis used to reproduce the microbi
 
 ## Data
 
-`physeq_clean_github.rds` contains the decontam-filtered phyloseq object used for downstream analyses.
+`physeq.rds` contains the decontam-filtered phyloseq object used for downstream analyses.
 Raw sequencing data are deposited separately in a public sequence repository.
 
 ## Analysis
